@@ -203,6 +203,20 @@ pub struct ClientConfig {
     /// [ClientConnection::new]: crate::client::ClientConnection::new
     pub max_fragment_size: Option<usize>,
 
+    /// Optional extension preference order for ClientHello serialization.
+    /// Only extensions actually offered are ordered. Unknown extensions follow
+    /// in numeric order; ECH/PSK mandatory placement is preserved. None retains
+    /// the upstream randomized order. The same preference applies after HRR.
+    pub client_hello_extension_order: Option<&'static [u16]>,
+
+    /// Signal RFC 5746 using an empty renegotiation_info extension instead of
+    /// SCSV when TLS 1.2 is offered. This does not enable renegotiation.
+    pub client_hello_renegotiation_extension: bool,
+
+    /// Request RFC 6962 SCT data. Received lists are structurally checked and
+    /// exposed after handshake completion, but CT log signatures are not verified.
+    pub request_scts: bool,
+
     /// How to decide what client auth certificate/keys to use.
     pub client_auth_cert_resolver: Arc<dyn ResolvesClientCert>,
 
@@ -484,6 +498,9 @@ pub struct Resumption {
 
     /// What mechanism is used for resuming a TLS 1.2 session.
     pub(super) tls12_resumption: Tls12Resumption,
+
+    /// Whether to advertise TLS 1.3 PSK modes and request tickets.
+    pub(super) request_tls13_tickets: bool,
 }
 
 impl Resumption {
@@ -496,6 +513,7 @@ impl Resumption {
         Self {
             store: Arc::new(super::handy::ClientSessionMemoryCache::new(num)),
             tls12_resumption: Tls12Resumption::SessionIdOrTickets,
+            request_tls13_tickets: true,
         }
     }
 
@@ -506,6 +524,7 @@ impl Resumption {
         Self {
             store,
             tls12_resumption: Tls12Resumption::SessionIdOrTickets,
+            request_tls13_tickets: true,
         }
     }
 
@@ -514,7 +533,19 @@ impl Resumption {
         Self {
             store: Arc::new(NoClientSessionStorage),
             tls12_resumption: Tls12Resumption::Disabled,
+            request_tls13_tickets: true,
         }
+    }
+
+    /// Disable resumption and omit TLS 1.3 PSK-mode/ticket-request extensions.
+    /// Uses the same non-storing cache as `disabled()`, so no cached session can
+    /// create a PSK offer without the modes extension. Unsolicited tickets are
+    /// still processed by the normal TLS state machine and are not retained.
+    /// `disabled()` keeps its upstream advertisement behavior for compatibility.
+    pub fn disabled_without_tickets() -> Self {
+        let mut resumption = Self::disabled();
+        resumption.request_tls13_tickets = false;
+        resumption
     }
 
     /// Configure whether TLS 1.2 sessions may be resumed, and by what mechanism.

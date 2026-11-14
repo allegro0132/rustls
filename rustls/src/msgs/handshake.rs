@@ -897,6 +897,9 @@ extension_struct! {
         ExtensionType::SignatureAlgorithms =>
             pub(crate) signature_schemes: Option<Vec<SignatureScheme>>,
 
+        ExtensionType::SCT =>
+            pub(crate) sct_request: Option<()>,
+
         /// Offered ALPN protocols (RFC6066)
         ExtensionType::ALProtocolNegotiation =>
             pub(crate) protocols: Option<Vec<ProtocolName>>,
@@ -989,6 +992,7 @@ impl ClientExtensions<'_> {
             named_groups,
             ec_point_formats,
             signature_schemes,
+            sct_request,
             protocols,
             client_certificate_types,
             server_certificate_types,
@@ -1017,6 +1021,7 @@ impl ClientExtensions<'_> {
             named_groups,
             ec_point_formats,
             signature_schemes,
+            sct_request,
             protocols,
             client_certificate_types,
             server_certificate_types,
@@ -1195,6 +1200,9 @@ extension_struct! {
         ExtensionType::RenegotiationInfo =>
             pub(crate) renegotiation_info: Option<PayloadU8>,
 
+        ExtensionType::SCT =>
+            pub(crate) scts: Option<SctList>,
+
         /// Selected ALPN protocol (RFC7301)
         ExtensionType::ALProtocolNegotiation =>
             pub(crate) selected_protocol: Option<SingleProtocolName>,
@@ -1258,6 +1266,7 @@ impl ServerExtensions<'_> {
             server_name_ack,
             session_ticket_ack,
             renegotiation_info,
+            scts,
             selected_protocol,
             key_share,
             preshared_key,
@@ -1278,6 +1287,7 @@ impl ServerExtensions<'_> {
             server_name_ack,
             session_ticket_ack,
             renegotiation_info,
+            scts,
             selected_protocol,
             key_share,
             preshared_key,
@@ -1725,8 +1735,28 @@ impl TlsListElement for CertificateDer<'_> {
 /// that is directly controllable by the peer.
 pub(crate) const CERTIFICATE_MAX_SIZE_LIMIT: usize = 0x1_0000;
 
+/// RFC 6962's non-empty vector of non-empty opaque SCTs. The enclosing
+/// extension limits total input to u16 bytes; no CT signature validity is implied.
+#[derive(Clone, Debug)]
+pub(crate) struct SctList(pub(crate) Vec<Vec<u8>>);
+impl Codec<'_> for SctList {
+    fn encode(&self, bytes: &mut Vec<u8>) {
+        let list = LengthPrefixedBuffer::new(ListLength::U16, bytes);
+        for sct in &self.0 { PayloadU16::<NonEmpty>::new(sct.clone()).encode(list.buf); }
+    }
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        let body = PayloadU16::<NonEmpty>::read(r)?;
+        let mut input = Reader::init(&body.0);
+        let mut entries = Vec::new();
+        while input.any_left() { entries.push(PayloadU16::<NonEmpty>::read(&mut input)?.0); }
+        Ok(Self(entries))
+    }
+}
+
 extension_struct! {
     pub(crate) struct CertificateExtensions<'a> {
+        ExtensionType::SCT =>
+            pub(crate) scts: Option<SctList>,
         ExtensionType::StatusRequest =>
             pub(crate) status: Option<CertificateStatus<'a>>,
     }
@@ -1736,6 +1766,7 @@ impl CertificateExtensions<'_> {
     fn into_owned(self) -> CertificateExtensions<'static> {
         CertificateExtensions {
             status: self.status.map(|s| s.into_owned()),
+            scts: self.scts,
         }
     }
 }

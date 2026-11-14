@@ -48,6 +48,7 @@ pub struct CommonState {
     #[cfg(feature = "std")]
     pub(crate) has_seen_eof: bool,
     pub(crate) peer_certificates: Option<CertificateChain<'static>>,
+    pub(crate) peer_scts: Vec<Vec<u8>>,
     message_fragmenter: MessageFragmenter,
     pub(crate) received_plaintext: ChunkVecBuffer,
     pub(crate) sendable_tls: ChunkVecBuffer,
@@ -83,6 +84,7 @@ impl CommonState {
             #[cfg(feature = "std")]
             has_seen_eof: false,
             peer_certificates: None,
+            peer_scts: Vec::new(),
             message_fragmenter: MessageFragmenter::default(),
             received_plaintext: ChunkVecBuffer::new(Some(DEFAULT_RECEIVED_PLAINTEXT_LIMIT)),
             sendable_tls: ChunkVecBuffer::new(Some(DEFAULT_BUFFER_LIMIT)),
@@ -138,6 +140,13 @@ impl CommonState {
     /// This choice simplifies the API and ensures backwards compatibility.
     pub fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]> {
         self.peer_certificates.as_deref()
+    }
+
+    /// Opaque RFC 6962 SCTs received for the peer leaf certificate. Returns an
+    /// empty slice until the handshake completes. CT log signatures have NOT
+    /// been verified; callers must validate them before relying on transparency.
+    pub fn peer_signed_certificate_timestamps(&self) -> &[Vec<u8>] {
+        if self.is_handshaking() { &[] } else { &self.peer_scts }
     }
 
     /// Retrieves the protocol agreed with the peer via ALPN.

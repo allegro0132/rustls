@@ -59,6 +59,8 @@ mod server_hello {
                 .server
                 .clone_from_slice(&server_hello.random.0[..]);
 
+            if let Some(scts) = &server_hello.scts { cx.common.peer_scts = scts.0.clone(); }
+
             // Look for TLS1.3 downgrade signal in server random
             // both the server random and TLS12_DOWNGRADE_SENTINEL are
             // public values and don't require constant time comparison

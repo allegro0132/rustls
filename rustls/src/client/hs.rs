@@ -26,7 +26,7 @@ use crate::enums::{
 use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::HandshakeHashBuffer;
 use crate::log::{debug, trace};
-use crate::msgs::base::Payload;
+use crate::msgs::base::{Payload, PayloadU8};
 use crate::msgs::enums::{Compression, ExtensionType};
 use crate::msgs::handshake::{
     CertificateStatusRequest, ClientExtensions, ClientExtensionsInput, ClientHelloPayload,
@@ -229,6 +229,7 @@ fn emit_client_hello_for_retry(
                 .verifier
                 .supported_verify_schemes(),
         ),
+        sct_request: config.request_scts.then_some(()),
         extended_master_secret_request: Some(()),
         certificate_status_request: Some(CertificateStatusRequest::build_ocsp()),
         protocols: extra_exts.protocols.clone(),
@@ -318,7 +319,7 @@ fn emit_client_hello_for_retry(
         exts.cookie = Some(cookie.clone());
     }
 
-    if supported_versions.tls13 {
+    if supported_versions.tls13 && config.resumption.request_tls13_tickets {
         // We could support PSK_KE here too. Such connections don't
         // have forward secrecy, and are similar to TLS1.2 resumption.
         exts.preshared_key_modes = Some(PskKeyExchangeModes {
@@ -390,7 +391,23 @@ fn emit_client_hello_for_retry(
 
     if supported_versions.tls12 {
         // We don't do renegotiation at all, in fact.
-        cipher_suites.push(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
+        if config.client_hello_renegotiation_extension {
+            exts.renegotiation_info = Some(PayloadU8::new(Vec::new()));
+        } else {
+            cipher_suites.push(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
+        }
+    }
+
+    if let Some(preference) = config.client_hello_extension_order {
+        let mut order = exts.used_extensions_in_encoding_order();
+        order.retain(|ext| !matches!(ext,
+            ExtensionType::PreSharedKey | ExtensionType::EncryptedClientHello
+            | ExtensionType::EncryptedClientHelloOuterExtensions));
+        order.sort_by_key(|ext| {
+            let code = u16::from(*ext);
+            (preference.iter().position(|v| *v == code).unwrap_or(preference.len()), code)
+        });
+        exts.contiguous_extensions = order;
     }
 
     let mut chp_payload = ClientHelloPayload {

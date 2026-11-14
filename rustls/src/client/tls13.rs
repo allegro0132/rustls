@@ -63,6 +63,7 @@ static DISALLOWED_TLS13_EXTS: &[ExtensionType] = &[
     ExtensionType::SessionTicket,
     ExtensionType::RenegotiationInfo,
     ExtensionType::ExtendedMasterSecret,
+    ExtensionType::SCT,
 ];
 
 /// `early_data_key_schedule` is `Some` if we sent the
@@ -1119,6 +1120,13 @@ impl State<ClientConnectionData> for ExpectCertificate {
             ));
         }
 
+        if !self.config.request_scts && cert_chain.entries.iter().any(|e| e.extensions.scts.is_some()) {
+            return Err(cx.common.send_fatal_alert(AlertDescription::UnsupportedExtension,
+                PeerMisbehaved::UnsolicitedSctList));
+        }
+        if let Some(scts) = cert_chain.entries.first().and_then(|e| e.extensions.scts.as_ref()) {
+            cx.common.peer_scts = scts.0.clone();
+        }
         let end_entity_ocsp = cert_chain.end_entity_ocsp().to_vec();
         let server_cert = ServerCertDetails::new(
             cert_chain
