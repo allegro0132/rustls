@@ -431,6 +431,12 @@ pub trait SupportedKxGroup: Send + Sync + Debug {
 
 /// An in-progress key exchange originating from a [`SupportedKxGroup`].
 pub trait ActiveKeyExchange: Send + Sync {
+    /// Derive a separate authentication secret without consuming the ephemeral
+    /// exchange. Providers must opt in; this does not alter the TLS key schedule.
+    fn authentication_secret(&self, _peer: &[u8]) -> Result<SharedSecret, Error> {
+        Err(Error::General("key exchange does not support authentication".into()))
+    }
+
     /// Completes the key exchange, given the peer's public key.
     ///
     /// This method must return an error if `peer_pub_key` is invalid: either

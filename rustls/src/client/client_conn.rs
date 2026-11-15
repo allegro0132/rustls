@@ -162,6 +162,9 @@ pub trait ResolvesClientCert: fmt::Debug + Send + Sync {
 /// [`RootCertStore`]: crate::RootCertStore
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
+    /// Optional authenticated session-ID provider. Only full TLS 1.3 handshakes
+    /// without ECH, resumption or HelloRetryRequest are supported by this hook.
+    pub session_id_authenticator: Option<Arc<dyn SessionIdAuthenticator>>,
     /// Which ALPN protocols we include in our client hello.
     /// If empty, no ALPN extension is sent.
     pub alpn_protocols: Vec<Vec<u8>>,
@@ -1118,3 +1121,14 @@ impl ClientConnectionData {
 }
 
 impl crate::conn::SideData for ClientConnectionData {}
+
+/// Authenticate a serialized ClientHello before it enters the transcript.
+/// `hello` includes the handshake header and a zero-filled 32-byte session ID.
+pub trait SessionIdAuthenticator: core::fmt::Debug + Send + Sync {
+    /// Optionally shape the full ClientHello before authenticating it. Preserve
+    /// the random, session ID, and actual key shares. Only TLS 1.3 is negotiated.
+    fn prepare(&self, hello: &[u8]) -> Result<Vec<u8>, Error> { Ok(hello.to_vec()) }
+    /// Return the authenticated session ID. Errors abort the handshake.
+    fn authenticate(&self, hello: &[u8], exchange: &dyn crate::crypto::ActiveKeyExchange)
+        -> Result<[u8; 32], Error>;
+}

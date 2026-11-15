@@ -172,6 +172,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
             resumption: Resumption::default(),
             max_fragment_size: None,
             client_hello_extension_order: None,
+            session_id_authenticator: None,
             client_hello_renegotiation_extension: false,
             request_scts: false,
             client_auth_cert_resolver,

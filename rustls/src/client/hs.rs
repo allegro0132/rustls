@@ -459,6 +459,31 @@ fn emit_client_hello_for_retry(
         _ => {}
     }
 
+    let mut authenticated_hello = None;
+    if let Some(auth) = &config.session_id_authenticator {
+        use crate::msgs::codec::Codec;
+        if retryreq.is_some() || tls13_session.is_some() || config.ech_mode.is_some()
+            || !config.supports_version(ProtocolVersion::TLSv1_3, cx.common.protocol)
+            || config.supports_version(ProtocolVersion::TLSv1_2, cx.common.protocol)
+            || cx.common.is_quic() {
+            return Err(Error::General("unsupported authenticated ClientHello mode".into()));
+        }
+        chp_payload.session_id = SessionId::authenticated([0; 32]);
+        let hello = HandshakeMessagePayload(HandshakePayload::ClientHello(chp_payload.clone())).get_encoding();
+        let mut hello = auth.prepare(&hello)?;
+        if hello.len()<71 || hello[4..71]!=HandshakeMessagePayload(HandshakePayload::ClientHello(chp_payload.clone())).get_encoding()[4..71] {
+            return Err(Error::General("ClientHello shaping changed authentication inputs".into()));
+        }
+        let mut reader = crate::msgs::codec::Reader::init(&hello);
+        let parsed = HandshakeMessagePayload::read_version(&mut reader, ProtocolVersion::TLSv1_3)?;
+        chp_payload = match parsed.0 {HandshakePayload::ClientHello(value) if !reader.any_left()=>value, _=>return Err(Error::General("invalid shaped ClientHello".into()))};
+        let exchange = key_share.as_ref().ok_or_else(|| Error::General("missing key share".into()))?;
+        input.session_id = SessionId::authenticated(auth.authenticate(&hello, exchange.as_ref())?);
+        chp_payload.session_id = input.session_id;
+        hello[39..71].copy_from_slice(input.session_id.as_ref());
+        authenticated_hello = Some(hello);
+    }
+
     // Note what extensions we sent.
     input.hello.sent_extensions = chp_payload.collect_used();
     input.hello.offered_cipher_suites = chp_payload.cipher_suites.clone();
@@ -497,7 +522,7 @@ fn emit_client_hello_for_retry(
             // (retryreq == None means we're in the "initial ClientHello" case)
             None => ProtocolVersion::TLSv1_0,
         },
-        payload: MessagePayload::handshake(chp),
+        payload: match authenticated_hello {Some(encoded)=>MessagePayload::Handshake {parsed:chp,encoded:Payload::new(encoded)},None=>MessagePayload::handshake(chp)},
     };
 
     if retryreq.is_some() {
