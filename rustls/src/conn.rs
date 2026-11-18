@@ -360,6 +360,9 @@ https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
     impl<T> ConnectionCommon<T> {
         /// Return the fatal error this connection previously encountered, if any.
         fn check_error(&self) -> io::Result<()> {
+            if self.core.common_state.record_layer.encryption_failed {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, Error::EncryptError));
+            }
             match &self.core.state {
                 Ok(_) => Ok(()),
                 Err(err) => Err(io::Error::new(io::ErrorKind::InvalidData, err.clone())),
@@ -386,7 +389,9 @@ https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
     impl<T> PlaintextSink for ConnectionCommon<T> {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.check_error()?;
-            Ok(self.send_plaintext(buf.into()))
+            let len = self.send_plaintext(buf.into());
+            self.check_error()?;
+            Ok(len)
         }
 
         fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
@@ -404,7 +409,9 @@ https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
                     OutboundChunks::new(&payload_owner)
                 }
             };
-            Ok(self.send_plaintext(payload))
+            let len = self.send_plaintext(payload);
+            self.check_error()?;
+            Ok(len)
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -919,6 +926,10 @@ impl<Data> ConnectionCore<Data> {
         let mut buffer_progress = self.hs_deframer.progress();
 
         loop {
+            if self.common_state.record_layer.encryption_failed {
+                self.state = Err(Error::EncryptError);
+                return Err(Error::EncryptError);
+            }
             let res = self.deframe(
                 Some(&*state),
                 deframer_buffer.filled_mut(),

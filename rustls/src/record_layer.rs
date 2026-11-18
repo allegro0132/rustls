@@ -25,6 +25,7 @@ pub(crate) struct RecordLayer {
     pending_encryption: Option<Box<dyn crate::crypto::cipher::PendingEncryption>>,
     pending_decryption: Option<Box<dyn crate::crypto::cipher::PendingDecryption>>,
     decryption_waker: Option<core::task::Waker>,
+    pub(crate) encryption_failed: bool,
     write_seq_max: u64,
     write_seq: u64,
     read_seq: u64,
@@ -47,6 +48,7 @@ impl RecordLayer {
             pending_encryption: None,
             pending_decryption: None,
             decryption_waker: None,
+            encryption_failed: false,
             write_seq_max: 0,
             write_seq: 0,
             read_seq: 0,
@@ -155,21 +157,22 @@ impl RecordLayer {
     pub(crate) fn encrypt_outgoing(
         &mut self,
         plain: OutboundPlainMessage<'_>,
-    ) -> OutboundOpaqueMessage {
+    ) -> Result<OutboundOpaqueMessage, Error> {
+        if self.encryption_failed { return Err(Error::EncryptError); }
         debug_assert!(self.encrypt_state == DirectionState::Active);
         assert!(self.next_pre_encrypt_action() != PreEncryptAction::Refuse);
         assert!(self.pending_encryption.is_none(), "pending record must finish first");
         let seq = self.write_seq;
         self.write_seq += 1;
-        self.message_encrypter
-            .encrypt(plain, seq)
-            .unwrap()
+        let result = self.message_encrypter.encrypt(plain, seq);
+        self.encryption_failed = result.is_err();
+        result
     }
 
     /// Reserve a sequence number once and retain the owned operation across
     /// polls. Failed/cancelled encryption never makes the nonce reusable.
     pub(crate) fn start_encrypt_outgoing(&mut self, plain: OutboundPlainMessage<'_>) -> Result<(), Error> {
-        if self.pending_encryption.is_some() || self.encrypt_state != DirectionState::Active
+        if self.encryption_failed || self.pending_encryption.is_some() || self.encrypt_state != DirectionState::Active
             || self.next_pre_encrypt_action() == PreEncryptAction::Refuse {
             return Err(Error::EncryptError);
         }
@@ -185,7 +188,7 @@ impl RecordLayer {
         let Some(op)=self.pending_encryption.as_mut() else {return Poll::Ready(Err(Error::EncryptError));};
         match op.poll(cx) {
             Poll::Pending=>Poll::Pending,
-            Poll::Ready(result)=>{self.pending_encryption=None;Poll::Ready(result)}
+            Poll::Ready(result)=>{self.pending_encryption=None;self.encryption_failed = result.is_err();Poll::Ready(result)}
         }
     }
 

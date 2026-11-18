@@ -68,6 +68,9 @@ impl<Data> UnbufferedConnectionCommon<Data> {
         let mut buffer_progress = self.core.hs_deframer.progress();
 
         let (discard, state) = loop {
+            if self.core.common_state.record_layer.encryption_failed {
+                return UnbufferedStatus { discard: buffer.pending_discard(), state: Err(Error::EncryptError) };
+            }
             if early_data_available(self) {
                 break (
                     buffer.pending_discard(),

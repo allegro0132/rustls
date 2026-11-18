@@ -340,7 +340,7 @@ impl CommonState {
                 payload,
             );
 
-        Ok(self.write_fragments(outgoing_tls, fragments))
+        self.write_fragments(outgoing_tls, fragments)
     }
 
     // Changing the keys must not span any fragmented handshake
@@ -431,19 +431,12 @@ impl CommonState {
     }
 
     fn send_single_fragment(&mut self, m: OutboundPlainMessage<'_>) {
-        if m.typ == ContentType::Alert {
-            // Alerts are always sendable -- never quashed by a PreEncryptAction.
-            let em = self.record_layer.encrypt_outgoing(m);
-            self.queue_tls_message(em);
+        if m.typ != ContentType::Alert && !self.check_pre_encrypt_action(0) {
             return;
         }
-
-        if !self.check_pre_encrypt_action(0) {
-            return;
+        if let Ok(message) = self.record_layer.encrypt_outgoing(m) {
+            self.queue_tls_message(message);
         }
-
-        let em = self.record_layer.encrypt_outgoing(m);
-        self.queue_tls_message(em);
     }
 
     /// Take the remedial action needed before encrypting the record `add` records after the next.
@@ -691,7 +684,7 @@ impl CommonState {
     ) -> Result<usize, EncryptError> {
         self.send_close_notify();
         self.check_required_size(outgoing_tls, [].into_iter())?;
-        Ok(self.write_fragments(outgoing_tls, [].into_iter()))
+        self.write_fragments(outgoing_tls, [].into_iter())
     }
 
     fn send_warning_alert_no_log(&mut self, desc: AlertDescription) {
@@ -723,7 +716,8 @@ impl CommonState {
         &mut self,
         outgoing_tls: &mut [u8],
         fragments: impl Iterator<Item = OutboundPlainMessage<'a>>,
-    ) -> usize {
+    ) -> Result<usize, EncryptError> {
+        if self.record_layer.encryption_failed { return Err(EncryptError::EncryptExhausted); }
         let mut written = 0;
 
         // Any pre-existing encrypted messages in `sendable_tls` must
@@ -738,6 +732,7 @@ impl CommonState {
             let em = self
                 .record_layer
                 .encrypt_outgoing(m)
+                .map_err(|_| EncryptError::EncryptExhausted)?
                 .encode();
 
             let len = em.len();
@@ -745,7 +740,7 @@ impl CommonState {
             written += len;
         }
 
-        written
+        Ok(written)
     }
 
     pub(crate) fn set_max_fragment_size(&mut self, new: Option<usize>) -> Result<(), Error> {
@@ -811,11 +806,9 @@ impl CommonState {
 
     pub(crate) fn enqueue_key_update_notification(&mut self) {
         let message = PlainMessage::from(Message::build_key_update_notify());
-        self.queued_key_update_message = Some(
-            self.record_layer
-                .encrypt_outgoing(message.borrow_outbound())
-                .encode(),
-        );
+        self.queued_key_update_message = self.record_layer
+            .encrypt_outgoing(message.borrow_outbound())
+            .ok().map(|record| record.encode());
     }
 
     pub(crate) fn received_tls13_change_cipher_spec(&mut self) -> Result<(), Error> {
