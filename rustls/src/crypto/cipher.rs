@@ -9,7 +9,7 @@ use crate::error::Error;
 use crate::msgs::codec;
 pub use crate::msgs::message::{
     BorrowedPayload, InboundOpaqueMessage, InboundPlainMessage, OutboundChunks,
-    OutboundOpaqueMessage, OutboundPlainMessage, PlainMessage, PrefixedPayload,
+    OutboundOpaqueMessage, OutboundPlainMessage, PlainMessage, PrefixedPayload, PayloadBuffer,
 };
 use crate::suites::ConnectionTrafficSecrets;
 
@@ -142,6 +142,51 @@ pub trait MessageDecrypter: Send + Sync {
         msg: InboundOpaqueMessage<'a>,
         seq: u64,
     ) -> Result<InboundPlainMessage<'a>, Error>;
+
+    /// Own one authenticated record across scheduler polls.
+    fn start_decrypt(&mut self, msg: InboundOpaqueMessage<'_>, seq: u64) -> Box<dyn PendingDecryption> {
+        Box::new(CompletedDecryption(Some(self.decrypt(msg, seq).map(|plain| OwnedPlaintext {
+            typ: plain.typ, version: plain.version, payload: plain.payload.to_vec(),
+        }))))
+    }
+}
+
+/// Authenticated plaintext, wiped if a caller drops it without consuming it.
+pub struct OwnedPlaintext {
+    pub typ: ContentType,
+    pub version: ProtocolVersion,
+    pub payload: alloc::vec::Vec<u8>,
+}
+impl Drop for OwnedPlaintext {
+    fn drop(&mut self) { self.payload.zeroize(); }
+}
+/// Pending or failed authentication must never expose plaintext.
+pub trait PendingDecryption: Send + Sync {
+    fn poll(&mut self, cx: &mut core::task::Context<'_>) -> core::task::Poll<Result<OwnedPlaintext, Error>>;
+}
+struct CompletedDecryption(Option<Result<OwnedPlaintext, Error>>);
+impl PendingDecryption for CompletedDecryption {
+    fn poll(&mut self, _: &mut core::task::Context<'_>) -> core::task::Poll<Result<OwnedPlaintext, Error>> {
+        core::task::Poll::Ready(self.0.take().unwrap_or(Err(Error::DecryptError)))
+    }
+}
+
+/// An owned, potentially asynchronous TLS record encryption operation.
+///
+/// Implementations retain all input and key state until completion. Dropping an
+/// operation cancels delivery, but must not free buffers still owned by DMA.
+/// A pending operation must arrange a wakeup when progress becomes possible.
+pub trait PendingEncryption: Send + Sync {
+    /// Complete exactly once; no ciphertext is visible while Pending.
+    fn poll(&mut self, cx: &mut core::task::Context<'_>)
+        -> core::task::Poll<Result<OutboundOpaqueMessage, Error>>;
+}
+
+struct CompletedEncryption(Option<Result<OutboundOpaqueMessage, Error>>);
+impl PendingEncryption for CompletedEncryption {
+    fn poll(&mut self, _: &mut core::task::Context<'_>) -> core::task::Poll<Result<OutboundOpaqueMessage, Error>> {
+        core::task::Poll::Ready(self.0.take().unwrap_or(Err(Error::EncryptError)))
+    }
 }
 
 /// Objects with this trait can encrypt TLS messages.
@@ -153,6 +198,14 @@ pub trait MessageEncrypter: Send + Sync {
         msg: OutboundPlainMessage<'_>,
         seq: u64,
     ) -> Result<OutboundOpaqueMessage, Error>;
+
+    /// Start one record, transferring ownership of its cryptographic operation.
+    /// The returned object must not borrow `msg` or this encrypter. Synchronous
+    /// providers retain their existing behavior through this default adapter.
+    fn start_encrypt(&mut self, msg: OutboundPlainMessage<'_>, seq: u64)
+        -> Box<dyn PendingEncryption> {
+        Box::new(CompletedEncryption(Some(self.encrypt(msg, seq))))
+    }
 
     /// Return the length of the ciphertext that results from encrypting plaintext of
     /// length `payload_len`

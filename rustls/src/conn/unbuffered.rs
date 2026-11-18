@@ -39,12 +39,31 @@ impl UnbufferedConnectionCommon<ServerConnectionData> {
 }
 
 impl<Data> UnbufferedConnectionCommon<Data> {
+    /// Whether the retained incoming record is awaiting authentication.
+    pub fn decryption_pending(&self) -> bool { self.core.common_state.record_layer.decryption_pending() }
+    /// Enable owned record decryption. Retain incoming bytes unchanged until
+    /// `discard` consumes them; `BlockedCrypto` requires polling after this wake.
+    /// Passing None restores synchronous reception after any pending record finishes.
+    pub fn set_decryption_waker(&mut self, waker: Option<&core::task::Waker>) {
+        self.core.common_state.record_layer.set_decryption_waker(waker);
+    }
+    /// Poll the record started by `WriteTraffic::start_encrypt_record`.
+    /// Incoming records and key updates remain blocked until this finishes.
+    pub fn poll_encrypt_record(&mut self,cx:&mut core::task::Context<'_>)
+        -> core::task::Poll<Result<crate::crypto::cipher::OutboundOpaqueMessage,Error>> {
+        self.core.common_state.record_layer.poll_encrypt_outgoing(cx)
+    }
+
+
     fn process_tls_records_common<'c, 'i>(
         &'c mut self,
         incoming_tls: &'i mut [u8],
         mut early_data_available: impl FnMut(&mut Self) -> bool,
         early_data_state: impl FnOnce(&'c mut Self, &'i mut [u8]) -> ConnectionState<'c, 'i, Data>,
     ) -> UnbufferedStatus<'c, 'i, Data> {
+        if self.core.common_state.record_layer.encryption_pending() {
+            return UnbufferedStatus {discard:0,state:Ok(ConnectionState::BlockedCrypto)};
+        }
         let mut buffer = DeframerSliceBuffer::new(incoming_tls);
         let mut buffer_progress = self.core.hs_deframer.progress();
 
@@ -132,6 +151,9 @@ impl<Data> UnbufferedConnectionCommon<Data> {
                 buffer.queue_discard(buffer_progress.take_discard());
 
                 self.core.state = Ok(state);
+            } else if self.core.common_state.record_layer.decryption_pending() {
+                buffer.queue_discard(buffer_progress.take_discard());
+                break (buffer.pending_discard(), ConnectionState::BlockedCrypto);
             } else if self.wants_write {
                 break (
                     buffer.pending_discard(),
@@ -258,6 +280,10 @@ pub enum ConnectionState<'c, 'i, Data> {
     /// was passed to [`UnbufferedConnectionCommon::process_tls_records`].
     BlockedHandshake,
 
+    /// An owned encryption operation is in flight. Call `poll_encrypt_record`
+    /// with the connection task's waker; do not discard any incoming bytes.
+    BlockedCrypto,
+
     /// The handshake process has been completed.
     ///
     /// [`WriteTraffic::encrypt`] can be called on the enclosed object to encrypt application
@@ -315,6 +341,7 @@ impl<Data> fmt::Debug for ConnectionState<'_, '_, Data> {
                 .debug_tuple("TransmitTlsData")
                 .finish(),
 
+            Self::BlockedCrypto => f.debug_tuple("BlockedCrypto").finish(),
             Self::BlockedHandshake => f
                 .debug_tuple("BlockedHandshake")
                 .finish(),
@@ -438,6 +465,21 @@ pub struct WriteTraffic<'c, Data> {
 }
 
 impl<Data> WriteTraffic<'_, Data> {
+    /// Start one application record without retaining a borrow of the input.
+    /// Returns the accepted plaintext prefix length. The caller must preserve
+    /// ordering and poll the connection's `poll_encrypt_record` before starting
+    /// another record. Zero means a key-update message must first be drained
+    /// through `process_tls_records`. Drop the connection to cancel a pending operation.
+    pub fn start_encrypt_record(&mut self, application_data:&[u8])->Result<usize,Error> {
+        if self.conn.core.common_state.record_layer.encryption_pending() {
+            return Err(Error::EncryptError);
+        }
+        self.conn.core.common_state.request_key_update_for(application_data.into());
+        self.conn.core.maybe_refresh_traffic_keys();
+        self.conn.core.common_state.start_plaintext_record(application_data)
+    }
+
+
     /// Encrypts `application_data` into the `outgoing_tls` buffer
     ///
     /// Returns the number of bytes that were written into `outgoing_tls`, or an error if
@@ -447,6 +489,9 @@ impl<Data> WriteTraffic<'_, Data> {
         application_data: &[u8],
         outgoing_tls: &mut [u8],
     ) -> Result<usize, EncryptError> {
+        if self.conn.core.common_state.record_layer.encryption_pending() {
+            return Err(EncryptError::EncryptExhausted);
+        }
         self.conn
             .core
             .common_state
@@ -465,6 +510,9 @@ impl<Data> WriteTraffic<'_, Data> {
     /// Returns the number of bytes that were written into `outgoing_tls`, or an error if
     /// the provided buffer is too small. In the error case, `outgoing_tls` is not modified
     pub fn queue_close_notify(&mut self, outgoing_tls: &mut [u8]) -> Result<usize, EncryptError> {
+        if self.conn.core.common_state.record_layer.encryption_pending() {
+            return Err(EncryptError::EncryptExhausted);
+        }
         self.conn
             .core
             .common_state

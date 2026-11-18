@@ -269,6 +269,23 @@ impl CommonState {
         }
     }
 
+    pub(crate) fn start_plaintext_record(&mut self, payload:&[u8]) -> Result<usize,Error> {
+        // Keep key-update notifications ahead of the next application record.
+        if self.record_layer.encryption_pending()
+            || self.record_layer.next_pre_encrypt_action()!=PreEncryptAction::Nothing {
+            return Err(Error::EncryptError);
+        }
+        if self.queued_key_update_message.is_some() {
+            self.perhaps_write_key_update();
+            return Ok(0);
+        }
+        let mut fragments=self.message_fragmenter.fragment_payload(ContentType::ApplicationData,ProtocolVersion::TLSv1_2,payload.into());
+        let message=fragments.next().ok_or(Error::EncryptError)?;
+        let accepted=message.payload.len();
+        self.record_layer.start_encrypt_outgoing(message)?;
+        Ok(accepted)
+    }
+
     pub(crate) fn write_plaintext(
         &mut self,
         payload: OutboundChunks<'_>,

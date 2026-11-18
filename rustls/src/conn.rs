@@ -1048,11 +1048,11 @@ impl<Data> ConnectionCore<Data> {
                     break (message.into_plain_message(), iter.bytes_consumed());
                 }
 
-                let message = match self
-                    .common_state
-                    .record_layer
-                    .decrypt_incoming(message)
-                {
+                let decrypted = match self.common_state.record_layer.poll_decrypt_incoming(message) {
+                    core::task::Poll::Pending => return Ok(None),
+                    core::task::Poll::Ready(result) => result,
+                };
+                let message = match decrypted {
                     // failed decryption during trial decryption is not allowed to be
                     // interleaved with partial handshake data.
                     Ok(None) if !self.hs_deframer.is_aligned() => {

@@ -189,14 +189,16 @@ impl OutboundOpaqueMessage {
         })
     }
 
-    pub fn encode(self) -> Vec<u8> {
-        let length = self.payload.len() as u16;
-        let mut encoded_payload = self.payload.0;
-        encoded_payload[0] = self.typ.into();
-        encoded_payload[1..3].copy_from_slice(&self.version.to_array());
-        encoded_payload[3..5].copy_from_slice(&(length).to_be_bytes());
-        encoded_payload
+    /// Encode in place while retaining external owned storage.
+    pub fn encode_payload(mut self) -> PrefixedPayload {
+        let length=self.payload.len() as u16;
+        let encoded=self.payload.encoded_mut();
+        encoded[0]=self.typ.into();
+        encoded[1..3].copy_from_slice(&self.version.to_array());
+        encoded[3..5].copy_from_slice(&length.to_be_bytes());
+        self.payload
     }
+    pub fn encode(self) -> Vec<u8> { self.encode_payload().into_vec() }
 
     /// Force conversion into a plaintext message.
     ///
@@ -211,65 +213,45 @@ impl OutboundOpaqueMessage {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct PrefixedPayload(Vec<u8>);
-
+/// Owned contiguous ciphertext storage, including five bytes of record header.
+pub trait PayloadBuffer: AsRef<[u8]> + AsMut<[u8]> + Send + Sync {}
+pub struct PrefixedPayload { owned:Vec<u8>, external:Option<alloc::boxed::Box<dyn PayloadBuffer>> }
+impl Clone for PrefixedPayload {fn clone(&self)->Self {Self::owned(self.encoded().to_vec())}}
+impl core::fmt::Debug for PrefixedPayload {
+    fn fmt(&self,f:&mut core::fmt::Formatter<'_>)->core::fmt::Result {f.debug_struct("PrefixedPayload").field("len",&self.len()).finish()}
+}
 impl PrefixedPayload {
-    pub fn with_capacity(capacity: usize) -> Self {
-        let mut prefixed_payload = Vec::with_capacity(HEADER_SIZE + capacity);
-        prefixed_payload.resize(HEADER_SIZE, 0);
-        Self(prefixed_payload)
+    fn owned(owned:Vec<u8>)->Self{Self{owned,external:None}}
+    /// Adopt storage whose first five bytes are reserved for the record header.
+    pub fn from_buffer(buffer:alloc::boxed::Box<dyn PayloadBuffer>)->Result<Self,crate::Error>{
+        if buffer.as_ref().as_ref().len()<HEADER_SIZE{return Err(crate::Error::EncryptError)}
+        Ok(Self{owned:Vec::new(),external:Some(buffer)})
     }
-
-    pub fn extend_from_slice(&mut self, slice: &[u8]) {
-        self.0.extend_from_slice(slice)
+    pub fn encoded(&self)->&[u8]{self.external.as_ref().map_or(&self.owned,|b|b.as_ref().as_ref())}
+    fn encoded_mut(&mut self)->&mut [u8]{match self.external.as_mut(){Some(b)=>b.as_mut().as_mut(),None=>&mut self.owned}}
+    fn make_owned(&mut self)->&mut Vec<u8>{
+        if let Some(buffer)=self.external.take(){self.owned=buffer.as_ref().as_ref().to_vec();}
+        &mut self.owned
     }
-
-    pub fn extend_from_chunks(&mut self, chunks: &OutboundChunks<'_>) {
-        chunks.copy_to_vec(&mut self.0)
+    fn into_vec(mut self)->Vec<u8>{self.make_owned();self.owned}
+    pub fn from_vec(mut payload:Vec<u8>)->Self{
+        let len=payload.len();payload.resize(len+HEADER_SIZE,0);payload.copy_within(..len,HEADER_SIZE);payload[..HEADER_SIZE].fill(0);Self::owned(payload)
     }
-
-    pub fn truncate(&mut self, len: usize) {
-        self.0.truncate(len + HEADER_SIZE)
+    pub fn with_capacity(capacity:usize)->Self{
+        let mut payload=Vec::with_capacity(HEADER_SIZE+capacity);payload.resize(HEADER_SIZE,0);Self::owned(payload)
     }
-
-    fn len(&self) -> usize {
-        self.0.len() - HEADER_SIZE
-    }
+    pub fn extend_from_slice(&mut self,slice:&[u8]){self.make_owned().extend_from_slice(slice)}
+    pub fn extend_from_chunks(&mut self,chunks:&OutboundChunks<'_>){chunks.copy_to_vec(self.make_owned())}
+    pub fn truncate(&mut self,len:usize){self.make_owned().truncate(len+HEADER_SIZE)}
+    fn len(&self)->usize{self.encoded().len()-HEADER_SIZE}
 }
-
-impl AsRef<[u8]> for PrefixedPayload {
-    fn as_ref(&self) -> &[u8] {
-        &self.0[HEADER_SIZE..]
-    }
-}
-
-impl AsMut<[u8]> for PrefixedPayload {
-    fn as_mut(&mut self) -> &mut [u8] {
-        &mut self.0[HEADER_SIZE..]
-    }
-}
-
-impl<'a> Extend<&'a u8> for PrefixedPayload {
-    fn extend<T: IntoIterator<Item = &'a u8>>(&mut self, iter: T) {
-        self.0.extend(iter)
-    }
-}
-
+impl AsRef<[u8]> for PrefixedPayload {fn as_ref(&self)->&[u8]{&self.encoded()[HEADER_SIZE..]}}
+impl AsMut<[u8]> for PrefixedPayload {fn as_mut(&mut self)->&mut [u8]{&mut self.encoded_mut()[HEADER_SIZE..]}}
+impl<'a> Extend<&'a u8> for PrefixedPayload {fn extend<T:IntoIterator<Item=&'a u8>>(&mut self,iter:T){self.make_owned().extend(iter)}}
 impl From<&[u8]> for PrefixedPayload {
-    fn from(content: &[u8]) -> Self {
-        let mut payload = Vec::with_capacity(HEADER_SIZE + content.len());
-        payload.extend(&[0u8; HEADER_SIZE]);
-        payload.extend(content);
-        Self(payload)
-    }
+    fn from(content:&[u8])->Self{let mut payload=Self::with_capacity(content.len());payload.extend_from_slice(content);payload}
 }
-
-impl<const N: usize> From<&[u8; N]> for PrefixedPayload {
-    fn from(content: &[u8; N]) -> Self {
-        Self::from(&content[..])
-    }
-}
+impl<const N:usize> From<&[u8;N]> for PrefixedPayload {fn from(content:&[u8;N])->Self{Self::from(&content[..])}}
 
 pub(crate) fn read_opaque_message_header(
     r: &mut Reader<'_>,

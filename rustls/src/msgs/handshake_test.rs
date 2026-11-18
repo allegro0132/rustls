@@ -823,6 +823,7 @@ fn sample_server_hello_payload() -> ServerHelloPayload {
         cipher_suite: CipherSuite::TLS_NULL_WITH_NULL_NULL,
         compression_method: Compression::Null,
         extensions: Box::new(ServerExtensions {
+            scts: None,
             ec_point_formats: Some(SupportedEcPointFormats::default()),
             server_name_ack: Some(()),
             session_ticket_ack: Some(()),
@@ -959,6 +960,7 @@ fn sample_certificate_payload_tls13() -> CertificatePayloadTls13<'static> {
         entries: vec![CertificateEntry {
             cert: CertificateDer::from(vec![3, 4, 5]),
             extensions: CertificateExtensions {
+                scts: None,
                 status: Some(CertificateStatus {
                     ocsp_response: PayloadU24::from(Payload::new(vec![1, 2, 3])),
                 }),
