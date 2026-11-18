@@ -158,7 +158,12 @@ pub struct OwnedPlaintext {
     pub payload: alloc::vec::Vec<u8>,
 }
 impl Drop for OwnedPlaintext {
-    fn drop(&mut self) { self.payload.zeroize(); }
+    fn drop(&mut self) {
+        // u8 has no destructor. Clearing the length makes the entire allocation
+        // available to one volatile wipe, including any truncated TLS padding.
+        self.payload.clear();
+        self.payload.spare_capacity_mut().zeroize();
+    }
 }
 /// Pending or failed authentication must never expose plaintext.
 pub trait PendingDecryption: Send + Sync {
