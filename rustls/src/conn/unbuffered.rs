@@ -377,18 +377,19 @@ impl<'c, 'i, Data> ReadTraffic<'c, 'i, Data> {
     /// Decrypts and returns the next available app-data record
     // TODO deprecate in favor of `Iterator` implementation, which requires in-place decryption
     pub fn next_record(&mut self) -> Option<Result<AppDataRecord<'_>, Error>> {
-        self.chunk = self
-            .conn
-            .core
-            .common_state
-            .received_plaintext
-            .pop();
+        self.chunk = self.next_owned_record();
         self.chunk.as_ref().map(|chunk| {
             Ok(AppDataRecord {
                 discard: 0,
                 payload: chunk,
             })
         })
+    }
+
+    /// Take ownership of the next authenticated application-data buffer.
+    /// As with `next_record`, the deframer already accounted for its wire bytes.
+    pub fn next_owned_record(&mut self) -> Option<Vec<u8>> {
+        self.conn.core.common_state.received_plaintext.pop()
     }
 
     /// Returns the payload size of the next app-data record *without* decrypting it
