@@ -83,18 +83,17 @@ impl RecordLayer {
             self.pending_decryption = Some(self.message_decrypter.start_decrypt(
                 InboundOpaqueMessage::new(encr.typ, encr.version, &mut encr.payload), self.read_seq));
         }
-        let result = match self.pending_decryption.as_mut().unwrap().poll(&mut Context::from_waker(&waker)) {
+        let result = match self.pending_decryption.as_mut().unwrap().poll_into(&mut Context::from_waker(&waker), &mut encr.payload) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(result) => result,
         };
         self.pending_decryption = None;
-        Poll::Ready(result.and_then(|plain| {
-            if plain.payload.len() > encr.payload.len() { return Err(Error::DecryptError); }
+        Poll::Ready(result.and_then(|(typ, version, len)| {
+            if len > encr.payload.len() { return Err(Error::DecryptError); }
             let want_close_before_decrypt = self.read_seq == SEQ_SOFT_LIMIT;
-            encr.payload[..plain.payload.len()].copy_from_slice(&plain.payload);
-            encr.payload.truncate(plain.payload.len());
-            encr.typ = plain.typ;
-            encr.version = plain.version;
+            encr.payload.truncate(len);
+            encr.typ = typ;
+            encr.version = version;
             self.read_seq += 1;
             self.has_decrypted = true;
             Ok(Some(Decrypted { want_close_before_decrypt, plaintext: encr.into_plain_message() }))

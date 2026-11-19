@@ -168,6 +168,18 @@ impl Drop for OwnedPlaintext {
 /// Pending or failed authentication must never expose plaintext.
 pub trait PendingDecryption: Send + Sync {
     fn poll(&mut self, cx: &mut core::task::Context<'_>) -> core::task::Poll<Result<OwnedPlaintext, Error>>;
+    /// Commit authenticated bytes into the caller's record buffer. Pending
+    /// and error results must leave the destination unchanged.
+    fn poll_into(&mut self, cx: &mut core::task::Context<'_>, dst: &mut [u8])
+        -> core::task::Poll<Result<(ContentType, ProtocolVersion, usize), Error>> {
+        self.poll(cx).map(|result| {
+            let plain = result?;
+            let len = plain.payload.len();
+            dst.get_mut(..len).ok_or(Error::DecryptError)?.copy_from_slice(&plain.payload);
+            Ok((plain.typ, plain.version, len))
+        })
+    }
+
 }
 struct CompletedDecryption(Option<Result<OwnedPlaintext, Error>>);
 impl PendingDecryption for CompletedDecryption {
