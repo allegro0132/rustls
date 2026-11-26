@@ -39,6 +39,11 @@ impl UnbufferedConnectionCommon<ServerConnectionData> {
 }
 
 impl<Data> UnbufferedConnectionCommon<Data> {
+    /// Allow the record provider to transfer authenticated application data in its
+    /// own allocation. Applies to synchronous TLS 1.3 traffic on this connection.
+    pub fn set_owned_record_rx(&mut self, enabled: bool) {
+        self.core.common_state.record_layer.prefer_owned_decryption = enabled;
+    }
     /// Whether the retained incoming record is awaiting authentication.
     pub fn decryption_pending(&self) -> bool { self.core.common_state.record_layer.decryption_pending() }
     /// Enable owned record decryption. Retain incoming bytes unchanged until

@@ -25,6 +25,7 @@ pub(crate) struct RecordLayer {
     pending_encryption: Option<Box<dyn crate::crypto::cipher::PendingEncryption>>,
     pending_decryption: Option<Box<dyn crate::crypto::cipher::PendingDecryption>>,
     decryption_waker: Option<core::task::Waker>,
+    pub(crate) prefer_owned_decryption: bool,
     pub(crate) encryption_failed: bool,
     write_seq_max: u64,
     write_seq: u64,
@@ -48,6 +49,7 @@ impl RecordLayer {
             pending_encryption: None,
             pending_decryption: None,
             decryption_waker: None,
+            prefer_owned_decryption: false,
             encryption_failed: false,
             write_seq_max: 0,
             write_seq: 0,
@@ -98,6 +100,29 @@ impl RecordLayer {
             self.has_decrypted = true;
             Ok(Some(Decrypted { want_close_before_decrypt, plaintext: encr.into_plain_message() }))
         }))
+    }
+
+    pub(crate) fn try_owned_record(
+        &mut self,
+        encr: &InboundOpaqueMessage<'_>,
+    ) -> Option<Result<crate::crypto::cipher::OwnedPlaintext, Error>> {
+        // Trial decryption, pending operations and the key-limit alert use the
+        // ordinary record-layer path and its existing sequence accounting.
+        if !self.prefer_owned_decryption
+            || self.decrypt_state != DirectionState::Active
+            || self.trial_decryption_len.is_some()
+            || self.decryption_waker.is_some()
+            || self.pending_decryption.is_some()
+            || self.read_seq == SEQ_SOFT_LIMIT
+        {
+            return None;
+        }
+        let result = self.message_decrypter.decrypt_owned_record(encr, self.read_seq)?;
+        if result.is_ok() {
+            self.read_seq += 1;
+            self.has_decrypted = true;
+        }
+        Some(result)
     }
 
     /// Decrypt a TLS message.

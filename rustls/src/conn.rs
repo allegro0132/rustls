@@ -20,6 +20,38 @@ use crate::record_layer::Decrypted;
 use crate::suites::ExtractedSecrets;
 use crate::vecbuf::ChunkVecBuffer;
 
+/// Owned application data follows the same TLS state and fragment checks.
+enum ReceivedRecord<'a> {
+    Borrowed(InboundPlainMessage<'a>),
+    Application(crate::crypto::cipher::OwnedPlaintext),
+}
+impl ReceivedRecord<'_> {
+    fn view(&self) -> InboundPlainMessage<'_> {
+        match self {
+            Self::Borrowed(msg) => InboundPlainMessage {
+                typ: msg.typ, version: msg.version, payload: msg.payload,
+            },
+            Self::Application(msg) => InboundPlainMessage {
+                typ: msg.typ, version: msg.version, payload: &msg.payload,
+            },
+        }
+    }
+}
+impl<'a> TryFrom<ReceivedRecord<'a>> for Message<'a> {
+    type Error = crate::error::InvalidMessage;
+    fn try_from(record: ReceivedRecord<'a>) -> Result<Self, Self::Error> {
+        match record {
+            ReceivedRecord::Borrowed(msg) => Self::try_from(msg),
+            ReceivedRecord::Application(mut msg) => Ok(Self {
+                version: msg.version,
+                payload: MessagePayload::ApplicationData(crate::msgs::base::Payload::Owned(
+                    mem::take(&mut msg.payload),
+                )),
+            }),
+        }
+    }
+}
+
 // pub so that it can be re-exported from the crate root
 pub mod kernel;
 pub(crate) mod unbuffered;
@@ -983,10 +1015,10 @@ impl<Data> ConnectionCore<Data> {
         state: Option<&dyn State<Data>>,
         buffer: &'b mut [u8],
         buffer_progress: &mut BufferProgress,
-    ) -> Result<Option<InboundPlainMessage<'b>>, Error> {
+    ) -> Result<Option<ReceivedRecord<'b>>, Error> {
         // before processing any more of `buffer`, return any extant messages from `hs_deframer`
         if self.hs_deframer.has_message_ready() {
-            Ok(self.take_handshake_message(buffer, buffer_progress))
+            Ok(self.take_handshake_message(buffer, buffer_progress).map(ReceivedRecord::Borrowed))
         } else {
             self.process_more_input(state, buffer, buffer_progress)
         }
@@ -1014,7 +1046,7 @@ impl<Data> ConnectionCore<Data> {
         state: Option<&dyn State<Data>>,
         buffer: &'b mut [u8],
         buffer_progress: &mut BufferProgress,
-    ) -> Result<Option<InboundPlainMessage<'b>>, Error> {
+    ) -> Result<Option<ReceivedRecord<'b>>, Error> {
         let version_is_tls13 = matches!(
             self.common_state.negotiated_version,
             Some(ProtocolVersion::TLSv1_3)
@@ -1026,7 +1058,7 @@ impl<Data> ConnectionCore<Data> {
             let mut iter = DeframerIter::new(&mut buffer[buffer_progress.processed()..]);
 
             let (message, processed) = loop {
-                let message = match iter.next().transpose() {
+                let mut message = match iter.next().transpose() {
                     Ok(Some(message)) => message,
                     Ok(None) => return Ok(None),
                     Err(err) => return Err(self.handle_deframe_error(err, state)),
@@ -1056,7 +1088,27 @@ impl<Data> ConnectionCore<Data> {
                 };
 
                 if allowed_plaintext && !self.hs_deframer.is_active() {
-                    break (message.into_plain_message(), iter.bytes_consumed());
+                    break (ReceivedRecord::Borrowed(message.into_plain_message()), iter.bytes_consumed());
+                }
+
+                if version_is_tls13
+                    && self.common_state.may_receive_application_data
+                    && message.typ == ContentType::ApplicationData
+                {
+                    if let Some(result) = self.common_state.record_layer.try_owned_record(&message) {
+                        let plain = result.map_err(|e| self.handle_deframe_error(e, state))?;
+                        if plain.typ == ContentType::ApplicationData {
+                            break (ReceivedRecord::Application(plain), iter.bytes_consumed());
+                        }
+                        // Handshake fragments must remain in the original deframer buffer.
+                        let len = plain.payload.len();
+                        if len > message.payload.len() { return Err(Error::DecryptError); }
+                        message.payload[..len].copy_from_slice(&plain.payload);
+                        message.payload.truncate(len);
+                        message.typ = plain.typ;
+                        message.version = plain.version;
+                        break (ReceivedRecord::Borrowed(message.into_plain_message()), iter.bytes_consumed());
+                    }
                 }
 
                 let decrypted = match self.common_state.record_layer.poll_decrypt_incoming(message) {
@@ -1089,10 +1141,11 @@ impl<Data> ConnectionCore<Data> {
                     self.common_state.send_close_notify();
                 }
 
-                break (plaintext, iter.bytes_consumed());
+                break (ReceivedRecord::Borrowed(plaintext), iter.bytes_consumed());
             };
 
-            if !self.hs_deframer.is_aligned() && message.typ != ContentType::Handshake {
+            let view = message.view();
+            if !self.hs_deframer.is_aligned() && view.typ != ContentType::Handshake {
                 // "Handshake messages MUST NOT be interleaved with other record
                 // types.  That is, if a handshake message is split over two or more
                 // records, there MUST NOT be any other records between them."
@@ -1100,7 +1153,7 @@ impl<Data> ConnectionCore<Data> {
                 return Err(PeerMisbehaved::MessageInterleavedWithHandshakeMessage.into());
             }
 
-            match message.payload.len() {
+            match view.payload.len() {
                 0 => {
                     if self.seen_consecutive_empty_fragments
                         == ALLOWED_CONSECUTIVE_EMPTY_FRAGMENTS_MAX
@@ -1123,12 +1176,19 @@ impl<Data> ConnectionCore<Data> {
             //
             // is fixed by -Zpolonius
             // https://github.com/rust-lang/rfcs/blob/master/text/2094-nll.md#problem-case-3-conditional-control-flow-across-functions
+            let message = match message {
+                ReceivedRecord::Borrowed(msg) => msg,
+                ReceivedRecord::Application(owned) => {
+                    buffer_progress.add_discard(processed);
+                    return Ok(Some(ReceivedRecord::Application(owned)));
+                }
+            };
             let unborrowed = InboundUnborrowedMessage::unborrow(&locator, message);
 
             if unborrowed.typ != ContentType::Handshake {
                 let message = unborrowed.reborrow(&Delocator::new(buffer));
                 buffer_progress.add_discard(processed);
-                return Ok(Some(message));
+                return Ok(Some(ReceivedRecord::Borrowed(message)));
             }
 
             let message = unborrowed.reborrow(&Delocator::new(buffer));
@@ -1144,7 +1204,7 @@ impl<Data> ConnectionCore<Data> {
                     .record_layer
                     .finish_trial_decryption();
 
-                return Ok(self.take_handshake_message(buffer, buffer_progress));
+                return Ok(self.take_handshake_message(buffer, buffer_progress).map(ReceivedRecord::Borrowed));
             }
         }
     }
@@ -1180,18 +1240,19 @@ impl<Data> ConnectionCore<Data> {
 
     fn process_msg(
         &mut self,
-        msg: InboundPlainMessage<'_>,
+        msg: ReceivedRecord<'_>,
         state: Box<dyn State<Data>>,
         sendable_plaintext: Option<&mut ChunkVecBuffer>,
     ) -> Result<Box<dyn State<Data>>, Error> {
         // Drop CCS messages during handshake in TLS1.3
-        if msg.typ == ContentType::ChangeCipherSpec
+        let view = msg.view();
+        if view.typ == ContentType::ChangeCipherSpec
             && !self
                 .common_state
                 .may_receive_application_data
             && self.common_state.is_tls13()
         {
-            if !msg.is_valid_ccs() {
+            if !view.is_valid_ccs() {
                 // "An implementation which receives any other change_cipher_spec value or
                 //  which receives a protected change_cipher_spec record MUST abort the
                 //  handshake with an "unexpected_message" alert."

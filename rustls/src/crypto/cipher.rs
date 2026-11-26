@@ -143,6 +143,11 @@ pub trait MessageDecrypter: Send + Sync {
         seq: u64,
     ) -> Result<InboundPlainMessage<'a>, Error>;
 
+    /// Optionally decrypt a synchronous record into private owned storage.
+    /// A provider must decline before consuming a nonce; errors expose no plaintext.
+    fn decrypt_owned_record(&mut self, _msg: &InboundOpaqueMessage<'_>, _seq: u64)
+        -> Option<Result<OwnedPlaintext, Error>> { None }
+
     /// Own one authenticated record across scheduler polls.
     fn start_decrypt(&mut self, msg: InboundOpaqueMessage<'_>, seq: u64) -> Box<dyn PendingDecryption> {
         Box::new(CompletedDecryption(Some(self.decrypt(msg, seq).map(|plain| OwnedPlaintext {
